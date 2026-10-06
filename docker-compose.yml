@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: aleksandr_kim_small
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - aleksandr_kim_pgdata:/var/lib/postgresql/data
+volumes:
+  aleksandr_kim_pgdata:

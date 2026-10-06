@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Заявки — aleksandr_kim</title>
+<style>body{font-family:sans-serif;margin:20px}table{border-collapse:collapse}td,th{border:1px solid #999;padding:3px 8px}
+a{cursor:pointer;color:#06c}section{margin-bottom:24px}</style></head>
+<body>
+<h2>Сервис учёта заявок (aleksandr_kim)</h2>
+<section id="auth">Логин <input id="login" value="staff1"> Пароль <input id="pass" type="password" value="demo">
+<button onclick="doLogin()">Войти</button> <span id="who"></span></section>
+<section><h3>Сводка</h3><button onclick="loadSummary()">Показать</button><div id="summary"></div></section>
+<section><h3>Список заявок</h3>
+Статус <select id="status"><option value="">все</option><option>new</option><option>in_progress</option><option>closed</option></select>
+<button onclick="page=1;loadList()">Фильтр</button>
+<button onclick="page=Math.max(1,page-1);loadList()">&larr;</button> стр. <span id="pg">1</span>
+<button onclick="page++;loadList()">&rarr;</button> всего: <span id="total"></span>
+<div id="list"></div></section>
+<section><h3>Карточка заявки</h3><div id="card">Выберите заявку в списке</div></section>
+<script>
+let token="", page=1;
+const H=()=>({"Authorization":"Bearer "+token,"Content-Type":"application/json"});
+async function doLogin(){
+  const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({login:login.value,password:pass.value})});
+  if(!r.ok){who.textContent="ошибка входа";return}
+  const d=await r.json();token=d.token;who.textContent="вошли ("+d.role+")";loadList();
+}
+async function loadList(){
+  const s=status.value?"&status="+status.value:"";
+  const r=await fetch("/api/tickets?page="+page+"&size=20"+s,{headers:H()});
+  if(!r.ok){list.textContent="нужна авторизация";return}
+  const d=await r.json();pg.textContent=page;total.textContent=d.total;
+  list.innerHTML="<table><tr><th>№</th><th>Тема</th><th>Статус</th><th>Категория</th><th>Автор</th></tr>"+
+   d.items.map(t=>`<tr><td><a onclick="openCard(${t.id})">${t.id}</a></td><td>${t.title}</td><td>${t.status}</td><td>${t.category}</td><td>${t.author}</td></tr>`).join("")+"</table>";
+}
+async function openCard(id){
+  const d=await (await fetch("/api/tickets/"+id,{headers:H()})).json();
+  card.innerHTML=`<b>#${d.id} ${d.title}</b> (${d.status}, ${d.category})<br>${d.body}<br>
+   Срок реакции, мин: ${d.reaction_minutes===null?"нет ответа":d.reaction_minutes.toFixed(0)}; норматив нарушен: ${d.norm_violated}
+   <ul>`+d.comments.map(c=>`<li>${c.author} (${c.role}): ${c.body}</li>`).join("")+"</ul>";
+}
+async function loadSummary(){
+  const r=await fetch("/api/summary",{headers:H()});
+  if(!r.ok){summary.textContent="нужна авторизация";return}
+  const d=await r.json();
+  summary.innerHTML="Открыто: "+d.open_total+", нарушено нормативов: "+d.violated+" из "+d.total+" ("+(d.violated_share*100).toFixed(1)+"%)<ul>"+
+   d.open_by_category.map(c=>`<li>${c.category}: ${c.open}</li>`).join("")+"</ul>";
+}
+</script></body></html>
