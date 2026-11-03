@@ -58,7 +58,9 @@ export const options = {
       duration: DURATION,
       preAllocatedVUs: Math.min(MAX_VUS, Math.max(10, Math.ceil(RATE * 2))),
       maxVUs: MAX_VUS,
-      gracefulStop: __ENV.GRACEFUL || '60s',
+      // ждём каждый начатый запрос до его тайм-аута (сводка — 180 с), иначе k6 прервёт его
+      // молча: такой запрос не попадёт ни в ответы, ни в ошибки
+      gracefulStop: __ENV.GRACEFUL || '200s',
       exec,
     },
   },
