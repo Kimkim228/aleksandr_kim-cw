@@ -145,7 +145,9 @@ def change_status(ticket_id: int, data: StatusIn, user=Depends(current_user), db
         raise HTTPException(status_code=422, detail="unknown status")
     if user["role"] != "staff":
         raise HTTPException(status_code=403, detail="staff only")
-    t = db.one("SELECT id, status FROM tickets WHERE id = %s", (ticket_id,))
+    # FOR UPDATE: строка заявки блокируется до конца транзакции. Иначе два одновременных
+    # запроса читают один и тот же статус и оба выполняют переход (ДЗ № 2, опыт load/race.js).
+    t = db.one("SELECT id, status FROM tickets WHERE id = %s FOR UPDATE", (ticket_id,))
     if t is None:
         raise HTTPException(status_code=404, detail="ticket not found")
     if not rules.can_transition(t["status"], data.status):
