@@ -1,150 +1,164 @@
-// Нагрузочный тест сервиса заявок (aleksandr_kim), ДЗ № 2.
-// Открытая модель: constant-arrival-rate, частота в запросах в секунду.
-//   k6 run -e SCENARIO=mixed   -e RATE=8 -e DURATION=30s load/test.js   # смешанный профиль
-//   k6 run -e SCENARIO=summary -e RATE=1 -e DURATION=30s load/test.js   # только сводка (самая тяжёлая)
+// Нагрузочный тест сервиса заявок (aleksandr_kim), k6.
+// Два сценария: mixed — операции по весам профиля нагрузки, heavy — только сводка
+// (самая тяжёлая операция по замерам первого задания). Модель нагрузки открытая:
+// частота в запросах в секунду (constant-arrival-rate), частота и длительность ступени —
+// параметрами запуска:
+//   k6 run -e SCENARIO=mixed -e RATE=8 -e DURATION=30s load/test.js
+//   k6 run -e SCENARIO=heavy -e RATE=0.2 -e DURATION=90s load/test.js
 import http from 'k6/http';
-import { check, fail } from 'k6';
-import { Counter } from 'k6/metrics';
+import exec from 'k6/execution';
+import { Counter, Trend } from 'k6/metrics';
 
-const BASE = __ENV.BASE || 'http://localhost:8030';
+const BASE = __ENV.BASE_URL || 'http://127.0.0.1:8029';
 const SCENARIO = __ENV.SCENARIO || 'mixed';
-const RATE = Number(__ENV.RATE || 2);       // запросов в секунду; дробная — реже одного в секунду
-// дробная частота (0.05 = один запрос в 20 с) задаётся через timeUnit: k6 принимает только целую rate
-const ARRIVAL = RATE >= 1 ? { rate: RATE, timeUnit: '1s' } : { rate: 1, timeUnit: `${Math.round(1 / RATE)}s` };
+const RATE = parseFloat(__ENV.RATE || '1');            // запросов в секунду, можно дробное
 const DURATION = __ENV.DURATION || '30s';
-const LOGIN = __ENV.LOGIN || 'staff1';          // та же учётная запись, что в замерах ДЗ № 1
+const TIMEOUT = __ENV.TIMEOUT || '120s';               // предел ожидания одного ответа
+const GRACE = __ENV.GRACEFUL_STOP || '120s';           // сколько ждать начатые запросы после ступени
+const TICKETS = parseInt(__ENV.TICKETS || '75000', 10); // заявок в рабочем наполнении
+const LOGIN = __ENV.LOGIN || 'staff1';
 const PASSWORD = __ENV.PASSWORD || 'demo';
-const MAX_VUS = Number(__ENV.MAX_VUS || 200);
-const N_TICKETS = 75000;                         // рабочее наполнение
-const N_CATEGORIES = 10;
+const PRE_VUS = parseInt(__ENV.PRE_VUS || String(Math.max(20, Math.ceil(RATE * 2))), 10);
+const MAX_VUS = parseInt(__ENV.MAX_VUS || String(Math.min(1000, Math.max(100, Math.ceil(RATE * 20)))), 10);
 
-// Профиль нагрузки: вес — доля операции в общем потоке, сумма 100 (обоснование — в README).
-export const PROFILE = [
-  ['list', 30],          // список заявок, стр. 1
-  ['card', 25],          // карточка заявки
-  ['list_filter', 15],   // список с отбором по статусу
-  ['comment', 13],       // комментарий к заявке
-  ['create', 6],         // новая заявка
-  ['categories', 5],     // справочник категорий
-  ['status', 5],         // смена статуса (сотрудник)
-  ['summary', 1],        // сводка
+// Профиль нагрузки: вес — доля операции в потоке, сумма весов 100 (обоснование — в отчёте).
+const PROFILE = [
+  { op: 'list', weight: 25 },         // GET /api/tickets, первая страница
+  { op: 'list_filter', weight: 15 },  // GET /api/tickets с отбором по статусу или категории
+  { op: 'list_page', weight: 5 },     // GET /api/tickets, страницы 2–10
+  { op: 'card', weight: 28 },         // GET /api/tickets/{id}
+  { op: 'categories', weight: 5 },    // GET /api/categories
+  { op: 'create', weight: 5 },        // POST /api/tickets
+  { op: 'comment', weight: 12 },      // POST /api/tickets/{id}/comments
+  { op: 'status', weight: 4 },        // POST /api/tickets/{id}/status
+  { op: 'summary', weight: 1 },       // GET /api/summary
 ];
 
-const OPS = PROFILE.map(([op]) => op);
-// коды ответов по операциям — для разбора ошибок (0 — нет ответа: истёк тайм-аут клиента)
-const codes = new Counter('codes');
-const CODES = [0, 200, 201, 409, 500];
-const exec = SCENARIO === 'mixed' ? 'mixed' : 'heavy';
+// Порядок операций — детерминированный: на каждые 100 запросов подряд каждая операция
+// встречается ровно столько раз, каков её вес (плавное взвешенное чередование).
+const CYCLE = [];
+const RANK = [];
+(function build() {
+  const cur = PROFILE.map(() => 0);
+  const seen = PROFILE.map(() => 0);
+  for (let i = 0; i < 100; i++) {
+    let best = 0;
+    for (let j = 0; j < PROFILE.length; j++) {
+      cur[j] += PROFILE[j].weight;
+      if (cur[j] > cur[best]) best = j;
+    }
+    cur[best] -= 100;
+    CYCLE.push(best);
+    RANK.push(seen[best]++);
+  }
+})();
 
-// Порог для всех один (подраздел 2.1): p95 < 500 мс, ошибок < 1 %.
-const thresholds = {
-  [`http_req_duration{scenario:${SCENARIO}}`]: ['p(95)<500'],
-  [`http_req_failed{scenario:${SCENARIO}}`]: ['rate<0.01'],
-  [`http_reqs{scenario:${SCENARIO}}`]: ['count>=0'],
-};
-// разбивка по операциям для разбора (условие всегда истинно, нужно только для отчёта)
-for (const op of OPS) {
-  thresholds[`http_req_duration{op:${op}}`] = ['max>=0'];
-  thresholds[`http_req_failed{op:${op}}`] = ['rate>=0'];
-  for (const c of CODES) thresholds[`codes{op:${op},code:${c}}`] = ['count>=0'];
-}
-
+// Порог один для всех (подраздел 2.1 методички): p95 < 500 мс, ошибок < 1 %.
+// Отбор по сценарию исключает из расчёта вход и подготовку в setup().
 export const options = {
   scenarios: {
     [SCENARIO]: {
       executor: 'constant-arrival-rate',
-      rate: ARRIVAL.rate,
-      timeUnit: ARRIVAL.timeUnit,
+      rate: Math.round(RATE * 100),
+      timeUnit: '100s',
       duration: DURATION,
-      preAllocatedVUs: Math.min(MAX_VUS, Math.max(10, Math.ceil(RATE * 2))),
+      preAllocatedVUs: Math.min(PRE_VUS, MAX_VUS),
       maxVUs: MAX_VUS,
-      // ждём каждый начатый запрос до его тайм-аута (сводка — 180 с), иначе k6 прервёт его
-      // молча: такой запрос не попадёт ни в ответы, ни в ошибки
-      gracefulStop: __ENV.GRACEFUL || '200s',
-      exec,
+      gracefulStop: GRACE,
+      exec: SCENARIO === 'heavy' ? 'heavy' : 'mixed',
     },
   },
-  thresholds,
-  summaryTrendStats: ['min', 'med', 'avg', 'p(90)', 'p(95)', 'max'],
+  thresholds: {
+    [`http_req_duration{scenario:${SCENARIO}}`]: ['p(95)<500'],
+    [`http_req_failed{scenario:${SCENARIO}}`]: ['rate<0.01'],
+  },
+  summaryTrendStats: ['min', 'med', 'p(95)', 'max', 'count'],
+  setupTimeout: '180s',
 };
 
-// Отказы по правилам варианта — не ошибки: комментарий к закрытой заявке и
-// недопустимый переход статуса отвечают 409 (заявку уже перевёл другой запрос).
-const RULE_REFUSALS = http.expectedStatuses(200, 201, 409);
+const dbTime = new Trend('db_time_ms');       // время в базе по заголовку X-DB-Time-Ms
+const dbQueries = new Trend('db_queries');    // число запросов к базе по заголовку X-DB-Queries
+const refusals = new Counter('expected_refusals'); // отказы по правилам варианта (409)
 
 function ids(token, status, pages) {
   const out = [];
   for (let p = 1; p <= pages; p++) {
-    const r = http.get(`${BASE}/api/tickets?page=${p}&size=100&status=${status}`,
-      { headers: { Authorization: `Bearer ${token}` }, tags: { op: 'setup' } });
-    if (r.status !== 200) fail(`setup: список ${status} вернул ${r.status}`);
-    for (const t of r.json('items')) out.push(t.id);
+    const r = http.get(`${BASE}/api/tickets?status=${status}&size=100&page=${p}`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: TIMEOUT });
+    if (r.status !== 200) throw new Error(`подготовка: список ${status} вернул ${r.status}`);
+    for (const t of r.json().items) out.push(t.id);
   }
   return out;
 }
 
-// Вход один раз до нагрузки: в результаты ступени он не попадает (у setup нет тега scenario).
+// Вход — один раз до нагрузки; в результаты не попадает (нет метки сценария).
 export function setup() {
   const r = http.post(`${BASE}/api/login`, JSON.stringify({ login: LOGIN, password: PASSWORD }),
-    { headers: { 'Content-Type': 'application/json' }, tags: { op: 'setup' } });
-  if (r.status !== 200) fail(`вход не выполнен: ${r.status}`);
-  const token = r.json('token');
+    { headers: { 'Content-Type': 'application/json' } });
+  if (r.status !== 200) throw new Error(`вход не выполнен: ${r.status}`);
+  const token = r.json().token;
+  if (SCENARIO === 'heavy') return { token };
+  // незакрытые заявки для комментариев и смены статуса
   return { token, newIds: ids(token, 'new', 5), progIds: ids(token, 'in_progress', 5) };
 }
 
-const rnd = (n) => 1 + Math.floor(Math.random() * n);
-const pick = (a) => a[Math.floor(Math.random() * a.length)];
-const TOTAL_WEIGHT = PROFILE.reduce((s, [, w]) => s + w, 0);
-
-function chooseOp() {
-  let x = Math.random() * TOTAL_WEIGHT;
-  for (const [op, w] of PROFILE) { if ((x -= w) < 0) return op; }
-  return PROFILE[0][0];
+function call(data, op, method, path, body, expected) {
+  const res = http.request(method, BASE + path, body ? JSON.stringify(body) : null, {
+    headers: { Authorization: `Bearer ${data.token}`, 'Content-Type': 'application/json' },
+    tags: { op: op, name: op },
+    timeout: TIMEOUT,
+    // отказы по правилам варианта (409) — ожидаемые ответы, а не ошибки
+    responseCallback: http.expectedStatuses(...expected),
+  });
+  const t = res.headers['X-Db-Time-Ms'] || res.headers['X-DB-Time-Ms'];
+  const q = res.headers['X-Db-Queries'] || res.headers['X-DB-Queries'];
+  if (t !== undefined) dbTime.add(parseFloat(t), { op: op });
+  if (q !== undefined) dbQueries.add(parseInt(q, 10), { op: op });
+  if (res.status === 409) refusals.add(1, { op: op });
+  return res;
 }
 
-function call(op, d) {
-  const H = { Authorization: `Bearer ${d.token}`, 'Content-Type': 'application/json' };
-  const p = (name, extra = {}) => Object.assign({ headers: H, tags: { op, name } }, extra);
+export function mixed(data) {
+  const it = exec.scenario.iterationInTest;
+  const slot = it % 100;
+  const op = PROFILE[CYCLE[slot]].op;
+  const k = Math.floor(it / 100) * PROFILE[CYCLE[slot]].weight + RANK[slot]; // номер вызова этой операции
   switch (op) {
     case 'list':
-      return http.get(`${BASE}/api/tickets?page=1&size=20`, p('GET /api/tickets'));
+      return call(data, op, 'GET', '/api/tickets?page=1&size=20', null, [200]);
     case 'list_filter':
-      return http.get(`${BASE}/api/tickets?page=1&size=20&status=${pick(['new', 'in_progress'])}`,
-        p('GET /api/tickets?status'));
+      return call(data, op, 'GET', k % 3 === 2
+        ? `/api/tickets?page=1&size=20&category_id=${(k % 10) + 1}`
+        : '/api/tickets?page=1&size=20&status=new', null, [200]);
+    case 'list_page':
+      return call(data, op, 'GET', `/api/tickets?page=${2 + (k % 9)}&size=20`, null, [200]);
     case 'card':
-      return http.get(`${BASE}/api/tickets/${rnd(N_TICKETS)}`, p('GET /api/tickets/{id}'));
+      return call(data, op, 'GET', `/api/tickets/${1 + (it * 7919) % TICKETS}`, null, [200]);
     case 'categories':
-      return http.get(`${BASE}/api/categories`, p('GET /api/categories'));
+      return call(data, op, 'GET', '/api/categories', null, [200]);
     case 'create':
-      return http.post(`${BASE}/api/tickets`,
-        JSON.stringify({ title: 'load', body: 'нагрузочный тест', category_id: rnd(N_CATEGORIES) }),
-        p('POST /api/tickets'));
-    case 'comment':
-      return http.post(`${BASE}/api/tickets/${pick(Math.random() < 0.5 ? d.newIds : d.progIds)}/comments`,
-        JSON.stringify({ body: 'нагрузочный тест' }),
-        p('POST /api/tickets/{id}/comments', { responseCallback: RULE_REFUSALS }));
-    case 'status': {
-      // сотрудник берёт новую заявку в работу или закрывает взятую
-      const take = Math.random() < 0.5;
-      const id = take ? pick(d.newIds) : pick(d.progIds);
-      return http.post(`${BASE}/api/tickets/${id}/status`,
-        JSON.stringify({ status: take ? 'in_progress' : 'closed' }),
-        p('POST /api/tickets/{id}/status', { responseCallback: RULE_REFUSALS }));
+      return call(data, op, 'POST', '/api/tickets',
+        { title: `k6 заявка ${it}`, body: 'нагрузочный тест', category_id: (k % 10) + 1 }, [201]);
+    case 'comment': {
+      // комментарий к незакрытой заявке; если её успели закрыть — 409 по правилу варианта
+      const pool = k % 2 === 0 ? data.newIds : data.progIds;
+      const id = pool[Math.floor(k / 2) % pool.length];
+      return call(data, op, 'POST', `/api/tickets/${id}/comments`, { body: `k6 ответ ${it}` }, [201, 409]);
     }
-    case 'summary':
-      return http.get(`${BASE}/api/summary`, p('GET /api/summary', { timeout: '180s' }));
+    case 'status': {
+      // сотрудник берёт новую заявку в работу или закрывает заявку в работе;
+      // недопустимый переход — 409 по правилу варианта
+      const toWork = k % 2 === 0;
+      const pool = toWork ? data.newIds : data.progIds;
+      const id = pool[pool.length - 1 - (Math.floor(k / 2) % pool.length)];
+      return call(data, op, 'POST', `/api/tickets/${id}/status`,
+        { status: toWork ? 'in_progress' : 'closed' }, [200, 409]);
+    }
+    default:
+      return call(data, 'summary', 'GET', '/api/summary', null, [200]);
   }
 }
 
-export function mixed(d) {
-  const op = chooseOp();
-  const r = call(op, d);
-  codes.add(1, { op, code: String(r.status) });
-  check(r, { 'ожидаемый код': (x) => [200, 201, 409].includes(x.status) });
-}
-
-export function heavy(d) {
-  const r = call('summary', d);
-  codes.add(1, { op: 'summary', code: String(r.status) });
-  check(r, { 'сводка 200': (x) => x.status === 200 });
+export function heavy(data) {
+  return call(data, 'summary', 'GET', '/api/summary', null, [200]);
 }

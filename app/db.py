@@ -3,10 +3,10 @@ import time
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from .config import DATABASE_URL, SCHEMA
+from .config import DATABASE_URL, DB_POOL_MAX, SCHEMA
 
 pool = ConnectionPool(
-    DATABASE_URL, min_size=2, max_size=10, open=False,
+    DATABASE_URL, min_size=2, max_size=DB_POOL_MAX, open=False,
     kwargs={"row_factory": dict_row, "options": f"-c search_path={SCHEMA}"},
 )
 

@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 bench-*.json
 load/results/
+load/.bin/
+dz2-results.zip
